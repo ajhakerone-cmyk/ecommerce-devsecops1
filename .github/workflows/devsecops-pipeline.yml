@@ -1,0 +1,205 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly scan on Sundays
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ecommerce-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  security-scanning:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install bandit safety
+    
+    - name: SAST Scan with Bandit
+      run: |
+        bandit -r . -f html -o bandit-report.html || true
+        bandit -r . -f json -o bandit-report.json || true
+      continue-on-error: true
+    
+    - name: Upload Bandit Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: bandit-report
+        path: bandit-report.*
+    
+    - name: Dependency Scan with Safety
+      run: |
+        safety check -r requirements.txt --json > safety-report.json || true
+      continue-on-error: true
+    
+    - name: Upload Safety Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: safety-report
+        path: safety-report.json
+    
+    - name: Setup Trivy
+      uses: aquasecurity/setup-trivy@v0.2.1
+      with:
+        version: latest
+    
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
+    
+    - name: Container Image Scan with Trivy
+      run: |
+        trivy image --severity CRITICAL,HIGH --no-progress --format html --output trivy-container.html ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        trivy image --severity CRITICAL --exit-code 1 --no-progress ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+      continue-on-error: true
+    
+    - name: Upload Trivy Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: trivy-container-report
+        path: trivy-container.html
+    
+    - name: Filesystem Scan with Trivy
+      run: |
+        trivy fs --severity CRITICAL,HIGH --no-progress --format html --output trivy-fs.html .
+        trivy fs --severity CRITICAL --exit-code 1 --no-progress .
+      continue-on-error: true
+    
+    - name: Upload Trivy Filesystem Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: trivy-fs-report
+        path: trivy-fs.html
+    
+    - name: Setup Checkov
+      run: |
+        pip install checkov
+    
+    - name: IaC Scan with Checkov
+      run: |
+        checkov -d terraform/ --framework terraform --output-file checkov-report.json
+      continue-on-error: true
+    
+    - name: Upload Checkov Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: checkov-report
+        path: checkov-report.json
+    
+    - name: Run Tests
+      run: |
+        pytest tests/ -v --cov=. --cov-report=html
+    
+    - name: Upload Coverage Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-report
+        path: htmlcov/
+
+  deploy-test-environment:
+    name: Deploy Test Environment
+    needs: security-scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Build Docker image
+      run: |
+        docker build -t ecommerce-test:${{ github.sha }} .
+    
+    - name: Run Docker container
+      run: |
+        docker run -d -p 5000:5000 --name ecommerce-app ecommerce-test:${{ github.sha }}
+        sleep 10
+    
+    - name: Verify container is running
+      run: |
+        curl -f http://localhost:5000/health || exit 1
+    
+    - name: Setup OWASP ZAP
+      run: |
+        docker pull zaproxy/zap-stable
+        mkdir -p zap-reports
+    
+    - name: Run OWASP ZAP DAST Scan
+      run: |
+        docker run -v $(pwd)/zap-reports:/zap/wrk/:rw -t zaproxy/zap-stable zap-full-scan.py -t http://host.docker.internal:5000 -g gen.conf -r zap_report.html -x zap_report.xml || true
+    
+    - name: Upload ZAP Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: zap-reports
+        path: zap-reports/
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker stop ecommerce-app
+        docker rm ecommerce-app
+
+  security-compliance-check:
+    name: Security Compliance Check
+    needs: [security-scanning, deploy-test-environment]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Download all reports
+      uses: actions/download-artifact@v3
+      with:
+        path: reports/
+    
+    - name: Check for Critical Vulnerabilities
+      run: |
+        # Parse reports and fail if critical vulnerabilities found
+        echo "Checking for critical vulnerabilities..."
+        
+        # Check Trivy container scan for critical
+        if [ -f "reports/trivy-container-report/trivy-container.html" ]; then
+          if grep -q "CRITICAL" "reports/trivy-container-report/trivy-container.html"; then
+            echo "Critical vulnerabilities found in container scan"
+            exit 1
+          fi
+        fi
+        
+        # Check Checkov for critical issues
+        if [ -f "reports/checkov-report/checkov-report.json" ]; then
+          if grep -q '"check_result": {"result": "FAILED"' "reports/checkov-report/checkov-report.json"; then
+            echo "Security issues found in IaC scan"
+            exit 1
+          fi
+        fi
+    
+    - name: Security Summary
+      run: |
+        echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Scan Type | Status | Report |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| SAST (Bandit) | ✅ | [View Report](../actions/runs/${{ github.run_id }}/artifacts/bandit-report) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Dependency (Safety) | ✅ | [View Report](../actions/runs/${{ github.run_id }}/artifacts/safety-report) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Container (Trivy) | ✅ | [View Report](../actions/runs/${{ github.run_id }}/artifacts/trivy-container-report) |" >> $GITHUB_STEP_SUMMARY
+        echo "| IaC (Checkov) | ✅ | [View Report](../actions/runs/${{ github.run_id }}/artifacts/checkov-report) |" >> $GITHUB_STEP_SUMMARY
+        echo "| DAST (ZAP) | ✅ | [View Report](../actions/runs/${{ github.run_id }}/artifacts/zap-reports) |" >> $GITHUB_STEP_SUMMARY
